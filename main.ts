@@ -1,6 +1,15 @@
 import { App, Notice, Plugin, PluginSettingTab, Setting, MarkdownView, Menu, Editor, FileSystemAdapter } from 'obsidian';
-import { RangeSetBuilder, Extension } from "@codemirror/state";
+import { RangeSetBuilder, Extension, StateEffect } from "@codemirror/state";
 import { Decoration, DecorationSet, EditorView, ViewPlugin, ViewUpdate } from "@codemirror/view";
+import {
+    findWordAt,
+    getSuggestions,
+    getWordRanges,
+    isCorrectWord,
+    replacementEnd,
+    splitPossessive,
+    wasWordEdited,
+} from './spellcheck';
 // @ts-ignore
 import nspell from 'nspell';
 
@@ -13,6 +22,8 @@ const DEFAULT_SETTINGS: SpellCheckerSettings = {
 }
 
 const spellcheckDecoration = Decoration.mark({ class: "sxjeel-misspelled" });
+const refreshSpellcheckEffect = StateEffect.define<void>();
+const SPELLCHECK_DELAY_MS = 500;
 
 // Fast Levenshtein distance calculation for fuzzy matching
 function getEditDistance(a: string, b: string): number {
@@ -58,6 +69,8 @@ export default class OfflineSpellChecker extends Plugin {
             class {
                 decorations: DecorationSet;
                 plugin: OfflineSpellChecker;
+                typingTimer: number | undefined;
+                editedRanges: {from: number, to: number}[] = [];
 
                 constructor(view: EditorView) {
                     this.plugin = (window as any).sxjeelSpellCheckerPluginInstance;
@@ -65,29 +78,55 @@ export default class OfflineSpellChecker extends Plugin {
                 }
 
                 update(update: ViewUpdate) {
-                    if (update.docChanged || update.viewportChanged) {
+                    const refreshRequested = update.transactions.some(transaction =>
+                        transaction.effects.some(effect => effect.is(refreshSpellcheckEffect))
+                    );
+
+                    if (refreshRequested) {
+                        this.clearTypingTimer();
+                        this.editedRanges = [];
                         this.decorations = this.buildDecorations(update.view);
+                    } else if (update.docChanged) {
+                        this.clearTypingTimer();
+                        this.editedRanges = [];
+                        update.changes.iterChangedRanges((_fromA, _toA, fromB, toB) => {
+                            this.editedRanges.push({from: fromB, to: toB});
+                        });
+                        this.decorations = this.buildDecorations(update.view, this.editedRanges);
+                        this.typingTimer = window.setTimeout(() => {
+                            this.typingTimer = undefined;
+                            this.editedRanges = [];
+                            update.view.dispatch({effects: refreshSpellcheckEffect.of(undefined)});
+                        }, SPELLCHECK_DELAY_MS);
+                    } else if (update.viewportChanged) {
+                        this.decorations = this.buildDecorations(update.view, this.editedRanges);
                     }
                 }
 
-                buildDecorations(view: EditorView): DecorationSet {
+                clearTypingTimer() {
+                    if (this.typingTimer !== undefined) {
+                        window.clearTimeout(this.typingTimer);
+                        this.typingTimer = undefined;
+                    }
+                }
+
+                destroy() {
+                    this.clearTypingTimer();
+                }
+
+                buildDecorations(view: EditorView, editedRanges: {from: number, to: number}[] = []): DecorationSet {
                     const builder = new RangeSetBuilder<Decoration>();
                     if (!this.plugin || !this.plugin.settings.isEnabled || this.plugin.spellcheckers.length === 0) {
                         return builder.finish();
                     }
 
-                    const wordRegex = /\b[a-zA-Z']+\b/g;
-
                     for (const { from, to } of view.visibleRanges) {
                         const text = view.state.doc.sliceString(from, to);
-                        let match;
-                        while ((match = wordRegex.exec(text)) !== null) {
-                            const word = match[0];
-                            if (word.length > 1) {
-                                const isCorrect = this.plugin.spellcheckers.some(sp => sp.correct(word));
-                                if (!isCorrect) {
-                                    builder.add(from + match.index, from + match.index + word.length, spellcheckDecoration);
-                                }
+                        for (const range of getWordRanges(text, from)) {
+                            if (range.word.length > 1
+                                && !wasWordEdited(range, editedRanges)
+                                && !isCorrectWord(range.word, this.plugin.spellcheckers)) {
+                                builder.add(range.from, range.to, spellcheckDecoration);
                             }
                         }
                     }
@@ -110,27 +149,25 @@ export default class OfflineSpellChecker extends Plugin {
                 if (!cm || !cm.state) return;
 
                 const pos = editor.posToOffset(cursor);
-                const wordRange = cm.state.wordAt(pos);
+                const wordRange = findWordAt(cm.state.doc.toString(), pos);
                 if (!wordRange) return;
 
-                const word = cm.state.doc.sliceString(wordRange.from, wordRange.to);
+                const word = wordRange.word;
                 const fromPos = editor.offsetToPos(wordRange.from);
                 const toPos = editor.offsetToPos(wordRange.to);
 
                 if (word.length > 1) {
-                    const isCorrect = this.spellcheckers.some(sp => sp.correct(word));
+                    const isCorrect = isCorrectWord(word, this.spellcheckers);
                     
                     if (!isCorrect) {
                         menu.addSeparator();
 
-                        let allSuggestions: string[] = [];
-                        this.spellcheckers.forEach(sp => {
-                            allSuggestions.push(...sp.suggest(word));
-                        });
+                        let allSuggestions = getSuggestions(word, this.spellcheckers);
 
                         // FALLBACK FUZZY ENGINE: If native engine returns poor options or nothing, use Levenshtein calculation
                         if (allSuggestions.length < 3 && this.masterVocabulary.length > 0) {
-                            const lowerWord = word.toLowerCase();
+                            const {stem, suffix} = splitPossessive(word);
+                            const lowerWord = stem.toLowerCase();
                             // Filter candidates of similar length to optimize lookup time down to milliseconds
                             const candidates = this.masterVocabulary.filter(w => Math.abs(w.length - lowerWord.length) <= 1);
                             
@@ -143,7 +180,7 @@ export default class OfflineSpellChecker extends Plugin {
                             }
                             // Sort by closest match and pull top entries
                             fuzzyMatches.sort((a, b) => a.score - b.score);
-                            const topFuzzy = fuzzyMatches.map(m => m.word);
+                            const topFuzzy = fuzzyMatches.map(m => `${m.word}${suffix}`);
                             allSuggestions.push(...topFuzzy);
                         }
 
@@ -160,18 +197,22 @@ export default class OfflineSpellChecker extends Plugin {
                                         .setIcon('check')
                                         .onClick(() => {
                                             editor.replaceRange(suggestion, fromPos, toPos);
+                                            editor.setCursor(replacementEnd(fromPos, suggestion));
+                                            editor.focus();
                                         });
                                 });
                             });
                         }
 
                         menu.addSeparator();
+                        const dictionaryWord = splitPossessive(word).stem;
                         menu.addItem((item) => {
-                            item.setTitle(`Add "${word}" to dictionary`)
+                            item.setTitle(`Add "${dictionaryWord}" to dictionary`)
                                 .setIcon('plus-with-circle')
                                 .onClick(async () => {
-                                    await this.addToPersonalDictionary(word);
-                                    new Notice(`Added "${word}" to dictionary`);
+                                    await this.addToPersonalDictionary(dictionaryWord);
+                                    this.refreshDecorations();
+                                    new Notice(`Added "${dictionaryWord}" to dictionary`);
                                     view.editor.focus();
                                 });
                         });
@@ -292,6 +333,13 @@ export default class OfflineSpellChecker extends Plugin {
         this.spellcheckers.forEach(sp => sp.add(word)); 
         this.masterVocabulary.push(word.toLowerCase());
     }
+
+    refreshDecorations() {
+        for (const leaf of this.app.workspace.getLeavesOfType('markdown')) {
+            const editor = (leaf.view as MarkdownView).editor as Editor & {cm?: EditorView};
+            editor.cm?.dispatch({effects: refreshSpellcheckEffect.of(undefined)});
+        }
+    }
 }
 
 class SpellCheckerSettingTab extends PluginSettingTab {
@@ -352,6 +400,7 @@ class SpellCheckerSettingTab extends PluginSettingTab {
                 .setCta()
                 .onClick(async () => {
                     await this.plugin.loadAllDictionaries();
+                    this.plugin.refreshDecorations();
                     this.plugin.app.workspace.updateOptions();
                     this.display(); 
                     new Notice("Dictionaries reloaded!");
