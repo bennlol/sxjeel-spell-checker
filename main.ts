@@ -296,14 +296,23 @@ export default class OfflineSpellChecker extends Plugin {
         const dictDir = `${this.manifest.dir}/dicts`;
 
         try {
-            const files = await adapter.list(dictDir);
-            const affFiles = files.files.filter(f => f.endsWith('.aff'));
+            const files: string[] = [];
+            const folders = [dictDir];
+            while (folders.length > 0) {
+                const folder = folders.pop();
+                if (!folder) continue;
+                const contents = await adapter.list(folder);
+                files.push(...contents.files);
+                folders.push(...contents.folders);
+            }
+
+            const affFiles = files.filter(f => f.endsWith('.aff'));
 
             for (const affPath of affFiles) {
-                const baseName = affPath.replace('.aff', '');
+                const baseName = affPath.slice(0, -4);
                 const dicPath = `${baseName}.dic`;
 
-                if (files.files.includes(dicPath)) {
+                if (files.includes(dicPath)) {
                     try {
                         const affFile = await adapter.read(affPath);
                         const dicFile = await adapter.read(dicPath);
