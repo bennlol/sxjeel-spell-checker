@@ -6,13 +6,11 @@ import nspell from 'nspell';
 
 interface SpellCheckerSettings {
     isEnabled: boolean;
-    deferWhileTyping: boolean;
     typingDelayMs: number;
 }
 
 const DEFAULT_SETTINGS: SpellCheckerSettings = {
     isEnabled: true,
-    deferWhileTyping: true,
     typingDelayMs: 500,
 }
 
@@ -99,11 +97,6 @@ export default class OfflineSpellChecker extends Plugin {
                     if (refreshRequested) {
                         this.clearTypingTimer();
                         this.decorations = this.buildDecorations(update.view);
-                    } else if (!this.plugin.settings.deferWhileTyping) {
-                        this.clearTypingTimer();
-                        if (update.docChanged || update.viewportChanged) {
-                            this.decorations = this.buildDecorations(update.view);
-                        }
                     } else if (update.docChanged) {
                         this.clearTypingTimer();
                         const cursor = update.state.selection.main.head;
@@ -422,24 +415,11 @@ class SpellCheckerSettingTab extends PluginSettingTab {
                 }));
 
         new Setting(containerEl)
-            .setName('Defer checking while typing')
-            .setDesc('Hide the active word underline while typing, then check it after a pause or when the word is committed.')
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.deferWhileTyping)
-                .onChange(async (value) => {
-                    this.plugin.settings.deferWhileTyping = value;
-                    await this.plugin.saveSettings();
-                    this.plugin.refreshDecorations();
-                    this.display();
-                }));
-
-        new Setting(containerEl)
             .setName('Typing delay (milliseconds)')
             .setDesc('Wait before checking the word currently being typed. Set to 0 to check immediately.')
             .addSlider(slider => slider
                 .setLimits(0, 2000, 100)
                 .setValue(this.plugin.settings.typingDelayMs)
-                .setDisabled(!this.plugin.settings.deferWhileTyping)
                 .setDynamicTooltip()
                 .onChange(async (value) => {
                     this.plugin.settings.typingDelayMs = value;
