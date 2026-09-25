@@ -6,10 +6,12 @@ import nspell from 'nspell';
 
 interface SpellCheckerSettings {
     isEnabled: boolean;
+    typingDelayMs: number;
 }
 
 const DEFAULT_SETTINGS: SpellCheckerSettings = {
     isEnabled: true,
+    typingDelayMs: 500,
 }
 
 const spellcheckDecoration = Decoration.mark({ class: "sxjeel-misspelled" });
@@ -80,6 +82,7 @@ export default class OfflineSpellChecker extends Plugin {
             class {
                 decorations: DecorationSet;
                 plugin: OfflineSpellChecker;
+                typingTimer: number | undefined;
 
                 constructor(view: EditorView) {
                     this.plugin = (window as any).sxjeelSpellCheckerPluginInstance;
@@ -90,12 +93,53 @@ export default class OfflineSpellChecker extends Plugin {
                     const refreshRequested = update.transactions.some(transaction =>
                         transaction.effects.some(effect => effect.is(refreshSpellcheckEffect))
                     );
-                    if (update.docChanged || update.viewportChanged || refreshRequested) {
+
+                    if (refreshRequested) {
+                        this.clearTypingTimer();
+                        this.decorations = this.buildDecorations(update.view);
+                    } else if (update.docChanged) {
+                        this.clearTypingTimer();
+                        const cursor = update.state.selection.main.head;
+                        let activeWord = findWordAt(update.state.doc, cursor);
+                        if (!activeWord && /['’]/.test(update.state.doc.sliceString(cursor - 1, cursor))) {
+                            activeWord = findWordAt(update.state.doc, cursor - 1);
+                        }
+
+                        if (!activeWord || this.plugin.settings.typingDelayMs <= 0) {
+                            this.decorations = this.buildDecorations(update.view);
+                            return;
+                        }
+
+                        const ignoredWord = activeWord;
+                        this.decorations = update.viewportChanged
+                            ? this.buildDecorations(update.view, ignoredWord)
+                            : this.decorations.map(update.changes).update({
+                                filter: (from, to) => to <= ignoredWord.from || from >= ignoredWord.to
+                            });
+
+                        this.typingTimer = window.setTimeout(() => {
+                            this.typingTimer = undefined;
+                            update.view.dispatch({ effects: refreshSpellcheckEffect.of(undefined) });
+                        }, this.plugin.settings.typingDelayMs);
+                    } else if (update.selectionSet && this.typingTimer !== undefined) {
+                        this.clearTypingTimer();
+                        this.decorations = this.buildDecorations(update.view);
+                    } else if (update.viewportChanged) {
+                        this.clearTypingTimer();
                         this.decorations = this.buildDecorations(update.view);
                     }
                 }
 
-                buildDecorations(view: EditorView): DecorationSet {
+                destroy() {
+                    this.clearTypingTimer();
+                }
+
+                clearTypingTimer() {
+                    if (this.typingTimer !== undefined) window.clearTimeout(this.typingTimer);
+                    this.typingTimer = undefined;
+                }
+
+                buildDecorations(view: EditorView, ignoredRange?: { from: number, to: number }): DecorationSet {
                     const builder = new RangeSetBuilder<Decoration>();
                     if (!this.plugin || !this.plugin.settings.isEnabled || this.plugin.spellcheckers.length === 0) {
                         return builder.finish();
@@ -109,8 +153,11 @@ export default class OfflineSpellChecker extends Plugin {
                             const word = match[0];
                             if (word.length > 1) {
                                 const isCorrect = isCorrectWord(word, this.plugin.spellcheckers);
-                                if (!isCorrect) {
-                                    builder.add(from + match.index, from + match.index + word.length, spellcheckDecoration);
+                                const wordFrom = from + match.index;
+                                const wordTo = wordFrom + word.length;
+                                const isIgnored = ignoredRange && wordFrom < ignoredRange.to && wordTo > ignoredRange.from;
+                                if (!isCorrect && !isIgnored) {
+                                    builder.add(wordFrom, wordTo, spellcheckDecoration);
                                 }
                             }
                         }
@@ -365,6 +412,19 @@ class SpellCheckerSettingTab extends PluginSettingTab {
                     }
                     this.plugin.app.workspace.updateOptions();
                     this.display(); 
+                }));
+
+        new Setting(containerEl)
+            .setName('Typing delay (milliseconds)')
+            .setDesc('Wait before checking the word currently being typed. Set to 0 to check immediately.')
+            .addSlider(slider => slider
+                .setLimits(0, 2000, 100)
+                .setValue(this.plugin.settings.typingDelayMs)
+                .setDynamicTooltip()
+                .onChange(async (value) => {
+                    this.plugin.settings.typingDelayMs = value;
+                    await this.plugin.saveSettings();
+                    this.plugin.refreshDecorations();
                 }));
 
         const loadedText = this.plugin.loadedDictNames.length > 0 
