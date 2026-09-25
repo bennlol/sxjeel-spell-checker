@@ -16,14 +16,14 @@ const DEFAULT_SETTINGS: SpellCheckerSettings = {
 
 const spellcheckDecoration = Decoration.mark({ class: "sxjeel-misspelled" });
 const refreshSpellcheckEffect = StateEffect.define<void>();
-const wordPattern = /\b[a-zA-Z]+(?:['’][a-zA-Z]+)*\b/g;
+const wordPattern = /(?<![\p{L}\p{M}\p{N}_])\p{L}[\p{L}\p{M}]*(?:['’]\p{L}[\p{L}\p{M}]*)*(?![\p{L}\p{M}\p{N}_])/gu;
 
 function getDictionaryWord(word: string): string {
     return word.replace(/['’]s$/i, '');
 }
 
 function isCorrectWord(word: string, spellcheckers: any[]): boolean {
-    const normalizedWord = word.replace(/’/g, "'");
+    const normalizedWord = word.normalize('NFC').replace(/’/g, "'");
     return spellcheckers.some(sp => sp.correct(normalizedWord));
 }
 
